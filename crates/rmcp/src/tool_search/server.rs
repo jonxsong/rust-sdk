@@ -8,8 +8,8 @@ use super::ToolSearchIndex;
 use crate::{
     ErrorData, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, JsonObject, ListToolsResult,
-        PaginatedRequestParams, Tool, ToolAnnotations,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+        JsonObject, ListToolsResult, PaginatedRequestParams, Tool, ToolAnnotations,
     },
     service::RequestContext,
 };
@@ -128,6 +128,19 @@ impl<H: ServerHandler> ToolSearchServer<H> {
                     context.clone(),
                 )
                 .await?;
+            result.ttl_ms = match (result.ttl_ms, page.ttl_ms) {
+                (Some(current), Some(next)) => Some(current.min(next)),
+                (current, next) => current.or(next),
+            };
+            result.cache_scope = if matches!(result.cache_scope, Some(CacheScope::Private))
+                || matches!(page.cache_scope, Some(CacheScope::Private))
+            {
+                Some(CacheScope::Private)
+            } else if result.cache_scope.is_some() || page.cache_scope.is_some() {
+                Some(CacheScope::Public)
+            } else {
+                None
+            };
             result.tools.extend(page.tools);
             result.next_cursor = page.next_cursor;
         }
@@ -217,14 +230,13 @@ impl<H: ServerHandler> ToolSearchServer<H> {
                 query: String,
                 max_results: Option<usize>,
             }
-            let args: Search = serde_json::from_value(json!(request.arguments))
-                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            let args: Search = match serde_json::from_value(json!(request.arguments)) {
+                Ok(args) => args,
+                Err(error) => return Ok(tool_error(error.to_string())),
+            };
             let limit = args.max_results.unwrap_or(self.config.max_results);
             if limit == 0 || limit > self.config.max_results {
-                return Err(ErrorData::invalid_params(
-                    "max_results is outside the configured range",
-                    None,
-                ));
+                return Ok(tool_error("max_results is outside the configured range"));
             }
             let mut tools = self.catalog(context).await?.tools;
             tools.retain(|tool| !self.config.always_visible.contains(&tool.name.to_string()));
@@ -246,17 +258,20 @@ impl<H: ServerHandler> ToolSearchServer<H> {
                 name: String,
                 arguments: Option<JsonObject>,
             }
-            let args: Call = serde_json::from_value(json!(request.arguments))
-                .map_err(|e| ErrorData::invalid_params(e.to_string(), None))?;
+            let args: Call = match serde_json::from_value(json!(request.arguments)) {
+                Ok(args) => args,
+                Err(error) => return Ok(tool_error(error.to_string())),
+            };
             if self.is_synthetic(&args.name) {
-                return Err(ErrorData::invalid_params(
-                    "cannot dispatch a synthetic tool",
-                    None,
-                ));
+                return Ok(tool_error("cannot dispatch a synthetic tool"));
             }
             request.name = args.name.into();
             request.arguments = args.arguments;
         }
         self.inner.call_tool(request, context).await
     }
+}
+
+fn tool_error(message: impl Into<String>) -> CallToolResponse {
+    CallToolResult::error(vec![ContentBlock::text(message)]).into()
 }

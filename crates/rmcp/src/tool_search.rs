@@ -111,9 +111,16 @@ impl ToolSearchIndex {
         let mut frequencies = HashMap::new();
         for tool in &self.tools {
             let mut text = tool.name.to_string();
-            for field in [tool.title.as_deref(), tool.description.as_deref()]
-                .into_iter()
-                .flatten()
+            for field in [
+                tool.title.as_deref().or_else(|| {
+                    tool.annotations
+                        .as_ref()
+                        .and_then(|annotations| annotations.title.as_deref())
+                }),
+                tool.description.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
             {
                 text.push(' ');
                 text.push_str(field);

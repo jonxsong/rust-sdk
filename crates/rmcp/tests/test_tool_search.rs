@@ -15,6 +15,14 @@ fn tool(name: &str, description: &str) -> Tool {
 }
 
 #[test]
+fn annotation_title_is_indexed_when_tool_title_is_absent() {
+    let mut definition = tool("opaque", "");
+    definition.annotations = Some(rmcp::model::ToolAnnotations::with_title("Weather forecast"));
+    let index = ToolSearchIndex::new(vec![definition.clone()]);
+    assert_eq!(index.search("forecast", 5)[0].tool, definition);
+}
+
+#[test]
 fn ranking_and_full_definitions() {
     let tools = vec![
         tool("github_create_issue", "Create a GitHub issue"),
@@ -89,7 +97,7 @@ mod server {
     use rmcp::{
         ErrorData, RoleServer, ServerHandler, ServiceExt,
         model::{
-            CallToolRequestParams, CallToolResponse, CallToolResult, ListPromptsResult,
+            CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ListPromptsResult,
             ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
         },
         service::RequestContext,
@@ -124,7 +132,13 @@ mod server {
                 tools: tools.iter().skip(offset).take(1).cloned().collect(),
                 next_cursor: (offset + 1 < tools.len()).then(|| (offset + 1).to_string()),
                 ..Default::default()
-            })
+            }
+            .with_ttl_ms(if offset == 0 { 10_000 } else { 0 })
+            .with_cache_scope(if offset == 0 {
+                CacheScope::Public
+            } else {
+                CacheScope::Private
+            }))
         }
 
         async fn call_tool(
@@ -183,6 +197,8 @@ mod server {
             .collect();
         assert_eq!(names, ["visible", "find", "dispatch"]);
         assert!(listing.next_cursor.is_none());
+        assert_eq!(listing.ttl_ms, Some(0));
+        assert_eq!(listing.cache_scope, Some(CacheScope::Private));
         let search = client
             .call_tool(
                 CallToolRequestParams::new("find")
@@ -213,15 +229,13 @@ mod server {
             assert_eq!(value["requestState"], "opaque-state");
         }
         for name in ["find", "dispatch"] {
-            assert!(
-                client
-                    .call_tool(
-                        CallToolRequestParams::new("dispatch")
-                            .with_arguments(json!({"name": name}).as_object().unwrap().clone()),
-                    )
-                    .await
-                    .is_err()
-            );
+            let result = client
+                .call_tool(
+                    CallToolRequestParams::new("dispatch")
+                        .with_arguments(json!({"name": name}).as_object().unwrap().clone()),
+                )
+                .await?;
+            assert_eq!(result.is_error, Some(true));
         }
         for arguments in [
             json!({"query": "github", "max_results": 0}),
@@ -230,15 +244,22 @@ mod server {
             json!({"query": 4}),
             json!({"query": "github", "extra": true}),
         ] {
-            assert!(
-                client
-                    .call_tool(
-                        CallToolRequestParams::new("find")
-                            .with_arguments(arguments.as_object().unwrap().clone()),
-                    )
-                    .await
-                    .is_err()
-            );
+            let result = client
+                .call_tool(
+                    CallToolRequestParams::new("find")
+                        .with_arguments(arguments.as_object().unwrap().clone()),
+                )
+                .await?;
+            assert_eq!(result.is_error, Some(true));
+        }
+        for arguments in [json!({}), json!({"name": 4})] {
+            let result = client
+                .call_tool(
+                    CallToolRequestParams::new("dispatch")
+                        .with_arguments(arguments.as_object().unwrap().clone()),
+                )
+                .await?;
+            assert_eq!(result.is_error, Some(true));
         }
         assert!(
             client
